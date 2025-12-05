@@ -10,7 +10,7 @@ import (
 )
 
 var db = sqldb.NewDatabase("feesdb", sqldb.DatabaseConfig{
-	Migrations: "./migrations", // relative to the bill package
+	Migrations: "./migrations",
 })
 
 const taskQueueName = "fees-billing"
@@ -21,32 +21,32 @@ type Service struct {
 	worker         worker.Worker
 }
 
-// initService is called by Encore to construct the service.
 func initService() (*Service, error) {
-	// Connect to Temporal (adjust HostPort if needed)
 	c, err := client.Dial(client.Options{
 		HostPort: "localhost:7233",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temporal client: %w", err)
+		return nil, fmt.Errorf("temporal client: %w", err)
 	}
 
-	// Start worker for our task queue
 	w := worker.New(c, taskQueueName, worker.Options{})
-	w.RegisterWorkflow(BillWorkflow)
+
+	// Register workflow + activities
+	w.RegisterWorkflow(BillLifecycleWorkflow)
+
+	// register activity functions
+	w.RegisterActivity(CreateBillRowActivity)
+	w.RegisterActivity(AddLineItemActivity)
+	w.RegisterActivity(CloseBillActivity)
 
 	if err := w.Start(); err != nil {
 		c.Close()
-		return nil, fmt.Errorf("failed to start temporal worker: %w", err)
+		return nil, fmt.Errorf("worker start: %w", err)
 	}
 
-	return &Service{
-		temporalClient: c,
-		worker:         w,
-	}, nil
+	return &Service{temporalClient: c, worker: w}, nil
 }
 
-// Shutdown is called when the service stops.
 func (s *Service) Shutdown(ctx context.Context) {
 	s.worker.Stop()
 	s.temporalClient.Close()

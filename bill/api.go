@@ -2,44 +2,18 @@ package bill
 
 import (
 	"context"
-	"time"
 
 	"encore.dev/beta/errs"
+	"github.com/google/uuid"
 	"go.temporal.io/sdk/client"
 )
-
-// --- DTOs ---
-
-type MoneyDTO struct {
-	AmountMinor int64    `json:"amount_minor"`
-	Currency    Currency `json:"currency"`
-}
-
-type LineItemDTO struct {
-	ID          string `json:"id"`
-	Description string `json:"description"`
-	AmountMinor int64  `json:"amount_minor"`
-	CreatedAt   string `json:"created_at"`
-}
-
-type BillDTO struct {
-	ID        string        `json:"id"`
-	Status    BillStatus    `json:"status"`
-	Currency  Currency      `json:"currency"`
-	Total     MoneyDTO      `json:"total"`
-	CreatedAt string        `json:"created_at"`
-	ClosedAt  *string       `json:"closed_at,omitempty"`
-	Items     []LineItemDTO `json:"items,omitempty"`
-}
-
-// --- Create bill ---
 
 type CreateBillRequest struct {
 	Currency Currency `json:"currency"`
 }
 
 type CreateBillResponse struct {
-	Bill BillDTO `json:"bill"`
+	BillID string `json:"bill_id"`
 }
 
 //encore:api public method=POST path=/bills
@@ -48,34 +22,24 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Crea
 		return nil, errs.B().Code(errs.InvalidArgument).Msg("unsupported currency").Err()
 	}
 
-	b, err := createBill(ctx, req.Currency)
-	if err != nil {
-		return nil, err
-	}
+	// Handler generates deterministic-safe ID
+	billID := uuid.New().String()
 
-	// Start workflow for this bill
-	_, err = s.temporalClient.ExecuteWorkflow(
+	_, err := s.temporalClient.ExecuteWorkflow(
 		ctx,
 		client.StartWorkflowOptions{
-			ID:        workflowIDForBill(b.ID),
+			ID:        workflowIDForBill(billID),
 			TaskQueue: taskQueueName,
 		},
-		BillWorkflow,
-		BillWorkflowParams{
-			BillID:   b.ID,
-			Currency: string(b.Currency),
-		},
+		BillLifecycleWorkflow,
+		BillWorkflowParams{BillID: billID, Currency: req.Currency},
 	)
 	if err != nil {
 		return nil, errs.B().Code(errs.Internal).Msg("start bill workflow").Err()
 	}
 
-	return &CreateBillResponse{
-		Bill: billToDTO(b, nil),
-	}, nil
+	return &CreateBillResponse{BillID: billID}, nil
 }
-
-// --- Add line item ---
 
 type AddLineItemRequest struct {
 	Description string   `json:"description"`
@@ -84,189 +48,133 @@ type AddLineItemRequest struct {
 }
 
 type AddLineItemResponse struct {
-	Bill     BillDTO     `json:"bill"`
-	LineItem LineItemDTO `json:"line_item"`
+	LineItemID string `json:"line_item_id"`
 }
 
 //encore:api public method=POST path=/bills/:id/line-items
 func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRequest) (*AddLineItemResponse, error) {
-	b, err := getBill(ctx, id)
+	if !req.Currency.Valid() {
+		return nil, errs.B().Code(errs.InvalidArgument).Msg("unsupported currency").Err()
+	}
+
+	// ✅ Pre-check status before signaling
+	status, billCurrency, err := getBillStatusAndCurrency(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	if b.Status != StatusOpen {
-		return nil, errs.B().Code(errs.FailedPrecondition).Msg("cannot add to closed bill").Err()
+	if status != StatusOpen {
+		return nil, errs.B().Code(errs.FailedPrecondition).Msg("bill is closed").Err()
 	}
-	if req.Currency != b.Currency {
-		return nil, errs.B().Code(errs.FailedPrecondition).
-			Msg("line item currency must match bill currency").Err()
-	}
-
-	li, err := insertLineItem(ctx, b, req.Description, req.AmountMinor)
-	if err != nil {
-		return nil, err
+	if billCurrency != req.Currency {
+		return nil, errs.B().Code(errs.FailedPrecondition).Msg("currency mismatch").Err()
 	}
 
-	// Signal workflow
+	lineItemID := uuid.New().String()
+
 	sig := AddLineItemSignal{
-		LineItemID:  li.ID,
-		AmountMinor: li.AmountMinor,
-		Description: li.Description,
-		Currency:    string(req.Currency),
-	}
-	if err := s.temporalClient.SignalWorkflow(ctx, workflowIDForBill(b.ID), "", signalAddLineItem, sig); err != nil {
-		return nil, errs.B().Code(errs.Internal).Msg("signal add-line-item").Err()
+		LineItemID:  lineItemID,
+		Description: req.Description,
+		AmountMinor: req.AmountMinor,
+		Currency:    req.Currency,
 	}
 
-	items, err := listLineItems(ctx, b.ID)
-	if err != nil {
-		return nil, err
+	if err := s.temporalClient.SignalWorkflow(ctx, workflowIDForBill(id), "", signalAddLineItem, sig); err != nil {
+		// Optional fallback mapping if workflow already finished unexpectedly
+		return nil, errs.B().Code(errs.FailedPrecondition).Msg("bill is closed").Err()
 	}
 
-	return &AddLineItemResponse{
-		Bill:     billToDTO(b, items),
-		LineItem: lineItemToDTO(li),
-	}, nil
+	return &AddLineItemResponse{LineItemID: lineItemID}, nil
 }
 
-// --- Close bill ---
-
 type CloseBillResponse struct {
-	Bill BillDTO `json:"bill"`
+	AmountMinor int64         `json:"amount_minor"`
+	Items       []LineItemDTO `json:"items"`
 }
 
 //encore:api public method=POST path=/bills/:id/close
 func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse, error) {
-	b, err := getBill(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if b.Status != StatusOpen {
-		return nil, errs.B().Code(errs.FailedPrecondition).Msg("bill already closed").Err()
-	}
-
-	// Signal workflow to close
-	if err := s.temporalClient.SignalWorkflow(ctx, workflowIDForBill(b.ID), "", signalCloseBill, CloseBillSignal{}); err != nil {
+	if err := s.temporalClient.SignalWorkflow(ctx, workflowIDForBill(id), "", signalCloseBill, CloseBillSignal{}); err != nil {
 		return nil, errs.B().Code(errs.Internal).Msg("signal close-bill").Err()
 	}
 
-	// Wait for workflow result
-	run := s.temporalClient.GetWorkflow(ctx, workflowIDForBill(b.ID), "")
+	run := s.temporalClient.GetWorkflow(ctx, workflowIDForBill(id), "")
 	var result BillResult
 	if err := run.Get(ctx, &result); err != nil {
 		return nil, errs.B().Code(errs.Internal).Msg("get workflow result").Err()
 	}
 
-	// Persist final total
-	updated, err := closeBill(ctx, b, result.TotalMinor)
-	if err != nil {
-		return nil, err
-	}
-
-	items, err := listLineItems(ctx, b.ID)
+	_, items, err := getBillWithItemsJoin(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 
 	return &CloseBillResponse{
-		Bill: billToDTO(updated, items),
+		AmountMinor: result.TotalMinor,
+		Items:       lineItemsToDTOs(items),
 	}, nil
 }
 
-// --- Get single bill ---
+// Encore GET query rule: no *string
+type ListBillsRequest struct {
+	Status string `query:"status"` // optional: ?status=OPEN or ?status=CLOSED
+}
 
-type GetBillResponse struct {
-	Bill BillDTO `json:"bill"`
+type ListBillsWithItemsResponse struct {
+	Bills []BillWithItemsDTO `json:"bills"`
+}
+
+type BillWithItemsDTO struct {
+	Bill  BillDTO       `json:"bill"`
+	Items []LineItemDTO `json:"items"`
+}
+
+// ==============================
+// Public API
+// ==============================
+
+//encore:api public method=GET path=/bills
+func (s *Service) ListBillsWithItems(ctx context.Context, req *ListBillsRequest) (*ListBillsWithItemsResponse, error) {
+	var st *BillStatus
+	if req != nil && req.Status != "" {
+		tmp := BillStatus(req.Status)
+		switch tmp {
+		case StatusOpen, StatusClosed:
+			st = &tmp
+		default:
+			return nil, errs.B().Code(errs.InvalidArgument).Msg("invalid status").Err()
+		}
+	}
+
+	bills, itemsByBill, err := listBillsWithItemsJoin(ctx, st)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]BillWithItemsDTO, 0, len(bills))
+	for _, b := range bills {
+		out = append(out, BillWithItemsDTO{
+			Bill:  billToDTO(b),
+			Items: lineItemsToDTOs(itemsByBill[b.ID]),
+		})
+	}
+
+	return &ListBillsWithItemsResponse{Bills: out}, nil
+}
+
+type GetBillWithItemsResponse struct {
+	Bill  BillDTO       `json:"bill"`
+	Items []LineItemDTO `json:"items"`
 }
 
 //encore:api public method=GET path=/bills/:id
-func (s *Service) GetBill(ctx context.Context, id string) (*GetBillResponse, error) {
-	b, err := getBill(ctx, id)
+func (s *Service) GetBillWithItems(ctx context.Context, id string) (*GetBillWithItemsResponse, error) {
+	b, items, err := getBillWithItemsJoin(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	items, err := listLineItems(ctx, b.ID)
-	if err != nil {
-		return nil, err
-	}
-	return &GetBillResponse{Bill: billToDTO(b, items)}, nil
-}
 
-// --- List bills ---
-
-type ListBillsRequest struct {
-    Status string `query:"status"` // ?status=open or ?status=closed
-}
-
-type ListBillsResponse struct {
-	Bills []BillDTO `json:"bills"`
-}
-
-//encore:api public method=GET path=/bills
-func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBillsResponse, error) {
-    var st *BillStatus
-
-    if req.Status != "" {
-        tmp := BillStatus(req.Status)
-        switch tmp {
-        case StatusOpen, StatusClosed:
-            st = &tmp
-        default:
-            return nil, errs.B().Code(errs.InvalidArgument).Msg("invalid status").Err()
-        }
-    }
-
-    bills, err := listBills(ctx, st)
-    if err != nil {
-        return nil, err
-    }
-
-    out := make([]BillDTO, 0, len(bills))
-    for _, b := range bills {
-        out = append(out, billToDTO(b, nil))
-    }
-    return &ListBillsResponse{Bills: out}, nil
-}
-
-
-
-// --- Helpers ---
-
-func workflowIDForBill(billID string) string {
-	return "bill-" + billID
-}
-
-func billToDTO(b *Bill, items []*LineItem) BillDTO {
-	var closedAtStr *string
-	if b.ClosedAt != nil {
-		s := b.ClosedAt.UTC().Format(time.RFC3339Nano)
-		closedAtStr = &s
-	}
-	dto := BillDTO{
-		ID:       b.ID,
-		Status:   b.Status,
-		Currency: b.Currency,
-		Total: MoneyDTO{
-			AmountMinor: b.TotalMinor,
-			Currency:    b.Currency,
-		},
-		CreatedAt: b.CreatedAt.UTC().Format(time.RFC3339Nano),
-		ClosedAt:  closedAtStr,
-	}
-	if items != nil {
-		dto.Items = make([]LineItemDTO, 0, len(items))
-		for _, li := range items {
-			dto.Items = append(dto.Items, lineItemToDTO(li))
-		}
-	}
-	return dto
-}
-
-func lineItemToDTO(li *LineItem) LineItemDTO {
-	return LineItemDTO{
-		ID:          li.ID,
-		Description: li.Description,
-		AmountMinor: li.AmountMinor,
-		CreatedAt:   li.CreatedAt.UTC().Format(time.RFC3339Nano),
-	}
+	return &GetBillWithItemsResponse{
+		Bill:  billToDTO(b),
+		Items: lineItemsToDTOs(items),
+	}, nil
 }
