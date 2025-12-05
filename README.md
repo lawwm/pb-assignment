@@ -27,3 +27,16 @@
   2. `POST /bills/:id/line-items` validates state then signals the workflow
   3. `POST /bills/:id/close` signals close and returns total + items
   4. `GET /bills` and `GET /bills/:id` are read models using joins
+
+Temporal setup:
+https://docs.temporal.io/self-hosted-guide/deployment
+
+```
+git clone https://github.com/temporalio/docker-compose.git
+cd docker-compose
+docker compose up
+```
+
+```
+encore run
+```
