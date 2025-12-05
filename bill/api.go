@@ -93,16 +93,29 @@ type CloseBillResponse struct {
 
 //encore:api public method=POST path=/bills/:id/close
 func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse, error) {
-	if err := s.temporalClient.SignalWorkflow(ctx, workflowIDForBill(id), "", signalCloseBill, CloseBillSignal{}); err != nil {
-		return nil, errs.B().Code(errs.Internal).Msg("signal close-bill").Err()
+	// ✅ Pre-check status before signaling
+	status, _, err := getBillStatusAndCurrency(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if status != StatusOpen {
+		return nil, errs.B().Code(errs.FailedPrecondition).Msg("bill is closed").Err()
 	}
 
+	// Signal workflow to close
+	if err := s.temporalClient.SignalWorkflow(ctx, workflowIDForBill(id), "", signalCloseBill, CloseBillSignal{}); err != nil {
+		// If the workflow is already completed/missing, align with business semantics
+		return nil, errs.B().Code(errs.FailedPrecondition).Msg("bill is closed").Err()
+	}
+
+	// Wait for workflow result
 	run := s.temporalClient.GetWorkflow(ctx, workflowIDForBill(id), "")
 	var result BillResult
 	if err := run.Get(ctx, &result); err != nil {
 		return nil, errs.B().Code(errs.Internal).Msg("get workflow result").Err()
 	}
 
+	// Indicate all line items being charged
 	_, items, err := getBillWithItemsJoin(ctx, id)
 	if err != nil {
 		return nil, err
